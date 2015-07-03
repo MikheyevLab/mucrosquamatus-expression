@@ -23,5 +23,15 @@
     {
         "n" : 8,
         "mem-per-cpu" : "4G"
+    },
+    "transdecoder":
+    {
+        "n" : 16,
+        "mem-per-cpu" : "2G"
+    },
+    "blast":
+    {
+        "n" : 16,
+        "mem-per-cpu" : "2G"
     }
 }
