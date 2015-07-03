@@ -1,0 +1,225 @@
+
+```{r}
+library(ggplot2)
+library(RMySQL)
+library(edgeR)
+library(WGCNA)
+library(GGally)
+library(DESeq2)
+library(reshape)
+library(flashClust)
+```
+
+
+```{r}
+
+```{r open_connection}
+#open SQL connection
+if (exists("mydb")) dbDisconnect(mydb)
+  mydb = dbConnect(MySQL(), dbname='mucrosquamatus-networks')
+```
+
+
+```{r ercc}
+ercc <-dbGetQuery(mydb,'SELECT fpkm.*, mix1.mix1, mix2.mix2 FROM fpkm 
+JOIN (SELECT id, attamoles_ul AS mix1 FROM ExFold WHERE mix=1) AS mix1
+ON gene_id = mix1.id
+JOIN (SELECT id, attamoles_ul AS mix2 FROM ExFold WHERE mix=2) AS mix2
+ON gene_id = mix2.id')
+
+factors <-dbGetQuery(mydb,'SELECT * FROM factors')
+rownames(factors) <- factors$id
+factors$days <- factor(factors$days)
+factors$sex <- factor(factors$sex)
+
+mix1<-melt(ercc[,c("gene_id","mix1",factors[factors$mix==1,"id"])],id=c("gene_id","mix1"))
+mix2<-melt(ercc[,c("gene_id","mix2",factors[factors$mix==2,"id"])],id=c("gene_id","mix2"))
+ggplot(mix2,aes(log(mix2,2),log(value,2),color=variable))+geom_point()
+ggplot(mix1,aes(log(mix1,2),log(value,2),color=variable))+geom_point()
+
+```
+
+```{r dge}
+fpkm <-dbGetQuery(mydb,'SELECT * FROM fpkm WHERE NOT gene_id REGEXP "^ERCC"')
+rownames(fpkm) <- fpkm$gene_id  ; fpkm <- fpkm[,-1]
+counts <-dbGetQuery(mydb,'SELECT * FROM counts WHERE NOT gene_id REGEXP "^ERCC"')
+rownames(counts) <- counts$gene_id  ; counts <- counts[,-1]
+
+keep <- rowMeans(fpkm)>=1  #eliminate genes with average fpkm >= 1
+table(keep)
+#design matrix
+
+design <- model.matrix(~factor(days)+factor(sex)+0,factors)
+rownames(design) <- rownames(factors)
+
+#glm
+dge <- DGEList(counts[keep,rownames(factors)])
+dge <- calcNormFactors(dge)
+dat <- estimateGLMCommonDisp(dge, design)
+dat <- estimateGLMTrendedDisp(dat, design)
+dat <- estimateGLMTagwiseDisp(dat, design)
+fit <- glmFit(dat,design)
+
+mds <- plotMDS(dge)
+ggpairs(factors[,c("svLength", "tailLength", "totLength", "headLength",  "mass")])
+mdsPlot <- data.frame(mds1=mds$cmdscale.out[,1], mds2=mds$cmdscale.out[,2], ID=rownames(mds$cmdscale.out),days=factors$days,sex=factors$sex,mass=factors$mass)
+ggplot(mdsPlot,aes(mds1,mds2,shape=sex,color=factor(days),size=log(mass)))+geom_point()+my_theme()
+
+oneVs8 <- glmLRT(fit,contrast=c(1,0,0,-1,0))  
+summary(caste.de <- decideTestsDGE(oneVs8, p=0.05, adjust="BH"))
+twoVs8 <- glmLRT(fit,contrast=c(0,1,0,-1,0))  
+summary(caste.de <- decideTestsDGE(twoVs8, p=0.05, adjust="BH"))
+fourVs8 <- glmLRT(fit,contrast=c(0,0,1,-1,0))  
+summary(caste.de <- decideTestsDGE(fourVs8, p=0.05, adjust="BH"))
+maleVsfemale <- glmLRT(fit,coef=5)  
+summary(caste.de <- decideTestsDGE(maleVsfemale, p=0.05, adjust="BH"))
+
+```
+
+
+## Filter invariant probes, and plot scale free topology
+
+```{r wgcna_soft_threshold, cache=TRUE}
+
+variance_filter <- function(data) {
+  # take WGNCA-style expression as input, and filter it for non-zero variance
+  variancedatExpr=as.vector(apply(as.matrix(data),2,var, na.rm=T))
+  return(data[, variancedatExpr>0 ])
+}
+
+soft_threshold <- function(data) {
+  disableWGCNAThreads()
+  # Choose a set of soft-thresholding powers, given a WGCNA data object
+  powers = c(c(1:10), seq(from = 12, to=16, by=2))
+  # Call the network topology analysis function
+  sft = pickSoftThreshold(data, powerVector = powers, verbose = 5,networkType = "signed")
+  # Plot the results:
+  sizeGrWindow(9, 5)
+  par(mfrow = c(1,2));
+  cex1 = 0.9;
+  # Scale-free topology fit index as a function of the soft-thresholding power
+  plot(sft$fitIndices[,1], -sign(sft$fitIndices[,3])*sft$fitIndices[,2],
+       xlab="Soft Threshold (power)",ylab="Scale Free Topology Model Fit,signed R^2",type="n",
+      main = paste("Scale independence"));
+  text(sft$fitIndices[,1], -sign(sft$fitIndices[,3])*sft$fitIndices[,2],
+      labels=powers,cex=cex1,col="red");
+  # this line corresponds to using an R^2 cut-off of h
+  abline(h=0.90,col="red")
+  # Mean connectivity as a function of the soft-thresholding power
+  plot(sft$fitIndices[,1], sft$fitIndices[,5],
+      xlab="Soft Threshold (power)",ylab="Mean Connectivity", type="n",
+      main = paste("Mean connectivity"))
+  text(sft$fitIndices[,1], sft$fitIndices[,5], labels=powers, cex=cex1,col="red")
+  par(mfrow = c(1,1));
+    
+}
+
+# filter more to speed up WGCNA
+keep2 <- rowMeans(fpkm)>=10
+table(keep2) 
+se <- DESeqDataSetFromMatrix(round(fpkm[keep2,]),factors[,c("days","sex")],formula(~days+sex))
+vst <-varianceStabilizingTransformation(se)
+vst <- rlog(se,fitType='local')
+# filter data and plot soft threshold parameters
+soft_threshold(variance_filter(t(assay(vst))))
+
+```
+
+Choosing power 12, since larger values tend to produce more problematic TOMs
+
+```{r WGCNA}
+enableWGCNAThreads()
+wgcna_adjacency <- function(datExpr, threshold, minModuleSize=30, MEDissThres = 0.2, deepSplit = 2) {
+  # takes WGNCA data expression matrix, a soft threshold
+  # optionally minimum module size, module eigengene dissimilarity threshold, and splitting threthold
+  # returns adjacency matrix, module eigengenes and a data frame of colors 
+  
+  #compute adjacency
+  adjacency <- adjacency(datExpr, power = threshold,type="signed")
+#  TOM <- TOMsimilarityFromExpr(datExpr,power = threshold, networkType="signed")
+  TOM <- TOMsimilarity(adjacency,TOMType="signed")
+  
+  geneTree <- flashClust(as.dist(1-TOM), method = "average");
+  # Module identification using dynamic tree cut:
+  dynamicMods <- cutreeDynamic(dendro = geneTree, distM = 1-TOM, deepSplit = 2, pamRespectsDendro = FALSE, minClusterSize = minModuleSize);
+  table(dynamicMods)
+  dynamicColors = labels2colors(dynamicMods)
+  
+  # Calculate eigengenes
+  MEList = moduleEigengenes(datExpr, colors = dynamicColors)
+  MEs = MEList$eigengenes
+  # Calculate dissimilarity of module eigengenes
+  METree = flashClust(as.dist(1-cor(MEs)), method = "average");
+  plot(METree, main = "Clustering of module eigengenes",xlab = "", sub = "")
+  # Plot the cut line into the dendrogram
+  abline(h=MEDissThres, col = "red")
+  
+  merge <- mergeCloseModules(datExpr, dynamicColors, cutHeight = MEDissThres, verbose = 0)
+  
+  # The merged module colors
+  mergedColors = merge$colors
+  # Eigengenes of the new merged modules:
+  mergedMEs = merge$newMEs
+  
+  # Rename to moduleColors
+  moduleColors = mergedColors
+  # Construct numerical labels corresponding to the colors
+  colorOrder = c("grey", standardColors(50));
+  moduleLabels = match(moduleColors, colorOrder)-1;
+  MEs = mergedMEs;
+  
+  # Recalculate MEs with color labels
+  invisible(MEs0 <- moduleEigengenes(datExpr, moduleColors)$eigengenes)
+  MEs = orderMEs(MEs0)
+  
+  print(table(moduleColors))
+  moduleColors <- as.data.frame(moduleColors)
+  rownames(moduleColors) <- colnames(datExpr)
+  
+  return(list(adjacency=adjacency,MEs=MEs,moduleColors=moduleColors))
+}
+```
+
+```{r}
+datExpr<-t(assay(vst))
+plotClusterTreeSamples(datExpr=datExpr)
+results <- wgcna_adjacency(datExpr,12,MEDissThres = 0.2)
+#results[["adjacency"]]
+#results[["MEs"]]
+table(results[["moduleColors"]])
+results[["moduleColors"]]["c22249_g1",]
+results[["moduleColors"]]["c65172_g1",]
+results[["moduleColors"]]["c22290_g4",]
+temp<-t(rbind(as.numeric(factors[colnames(fpkm),"days"]),fpkm["c22290_g4",]))
+plot(temp[,1],temp[,2])
+cor.test(temp[,1],temp[,2])
+```
+
+
+```{r module_trait}
+plotModuleTrait <-function(moduleTraitCor,moduleTraitPvalue,species) {
+  # plot heatmap with module-trait correlation data
+  textMatrix = paste(signif(moduleTraitCor, 2), " (",
+  signif(moduleTraitPvalue, 1), ")", sep = "");
+  dim(textMatrix) = dim(moduleTraitCor)
+  par(mar = c(6, 8.5, 3, 3));
+  # Display the correlation values within a heatmap plot
+  labeledHeatmap(Matrix = moduleTraitCor,
+  xLabels = colnames(moduleTraitCor),
+  yLabels = rownames(moduleTraitCor),
+  colorLabels = FALSE,
+  colors = blueWhiteRed(50),
+  textMatrix = textMatrix,
+  setStdMargins = FALSE,
+  cex.text = .5,
+  zlim = c(-1,1),
+  main = paste("Module-trait relationships",species))
+}
+
+moduleTraitCor = cor(results[["MEs"]], as.numeric(factors$days), use = "p",method="spearman")
+moduleTraitPvalue = corPvalueStudent(moduleTraitCor, nSamples=30)
+print(table(moduleTraitPvalue < 0.05))
+
+ggplot(data.frame(cor=moduleTraitCor,name=rownames(moduleTraitCor),pval=moduleTraitPvalue),aes(x=1,y=name,label=paste(signif(moduleTraitCor, 2), " (", signif(moduleTraitPvalue, 2), ")", sep = "")))+ geom_tile(aes(fill=cor))+ scale_fill_gradient(low = "steelblue",high = "#FF4D4D")+theme_bw()+geom_text()+xlab("")+ylab("")+theme(axis.text.x  = element_blank(),axis.ticks.x  = element_blank())
+
+```
