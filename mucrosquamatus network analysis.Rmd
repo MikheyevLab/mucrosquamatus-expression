@@ -8,6 +8,8 @@ library(GGally)
 library(DESeq2)
 library(reshape)
 library(flashClust)
+library(GOstats)
+library(GSEABase)
 ```
 
 
@@ -44,8 +46,13 @@ fpkm <-dbGetQuery(mydb,'SELECT * FROM fpkm WHERE NOT gene_id REGEXP "^ERCC"')
 rownames(fpkm) <- fpkm$gene_id  ; fpkm <- fpkm[,-1]
 counts <-dbGetQuery(mydb,'SELECT * FROM counts WHERE NOT gene_id REGEXP "^ERCC"')
 rownames(counts) <- counts$gene_id  ; counts <- counts[,-1]
+proteins <- dbGetQuery(mydb,'SELECT proteins.*, class FROM proteins JOIN classes ON classes.id = proteins.id GROUP BY proteins.id')
+rownames(proteins) <- proteins$id
+#blast table previously result from fpkm filtering (>1)
+blast <- dbGetQuery(mydb,'SELECT blast.*, rate FROM blast LEFT OUTER JOIN (SELECT id, AVG(rate) AS rate FROM dnds GROUP BY id) dnds1 ON dnds1.id = blast.id')
+rownames(blast) <- blast$id 
 
-keep <- rowMeans(fpkm)>=1  #eliminate genes with average fpkm >= 1
+keep <- (rowMeans(fpkm)>=1 & (rownames(fpkm) %in% rownames(blast)))  #eliminate genes with average fpkm >= 1
 table(keep)
 #design matrix
 
@@ -73,7 +80,9 @@ fourVs8 <- glmLRT(fit,contrast=c(0,0,1,-1,0))
 summary(caste.de <- decideTestsDGE(fourVs8, p=0.05, adjust="BH"))
 maleVsfemale <- glmLRT(fit,coef=5)  
 summary(caste.de <- decideTestsDGE(maleVsfemale, p=0.05, adjust="BH"))
-
+#is there sex-biased expression in venom proteins?
+table(p.adjust(maleVsfemale$table[proteins$id,"PValue"],method="fdr")<0.05)
+#nope, which makes sense given that the both eat the same things
 ```
 
 
@@ -90,7 +99,7 @@ variance_filter <- function(data) {
 soft_threshold <- function(data) {
   disableWGCNAThreads()
   # Choose a set of soft-thresholding powers, given a WGCNA data object
-  powers = c(c(1:10), seq(from = 12, to=16, by=2))
+  powers = seq(from = 14, to=20, by=2)
   # Call the network topology analysis function
   sft = pickSoftThreshold(data, powerVector = powers, verbose = 5,networkType = "signed")
   # Plot the results:
@@ -113,19 +122,18 @@ soft_threshold <- function(data) {
   par(mfrow = c(1,1));
     
 }
+```
 
-# filter more to speed up WGCNA
-keep2 <- rowMeans(fpkm)>=10
-table(keep2) 
-se <- DESeqDataSetFromMatrix(round(fpkm[keep2,]),factors[,c("days","sex")],formula(~days+sex))
+```{r setup_wgcna}
+se <- DESeqDataSetFromMatrix(round(fpkm[keep,]),factors[,c("days","sex")],formula(~days+sex))
 vst <-varianceStabilizingTransformation(se)
-vst <- rlog(se,fitType='local')
+# vst <- rlog(se,fitType='local') # not as good
 # filter data and plot soft threshold parameters
 soft_threshold(variance_filter(t(assay(vst))))
 
 ```
 
-Choosing power 12, since larger values tend to produce more problematic TOMs
+Choosing power 16
 
 ```{r WGCNA}
 enableWGCNAThreads()
@@ -183,17 +191,36 @@ wgcna_adjacency <- function(datExpr, threshold, minModuleSize=30, MEDissThres = 
 ```{r}
 datExpr<-t(assay(vst))
 plotClusterTreeSamples(datExpr=datExpr)
-results <- wgcna_adjacency(datExpr,12,MEDissThres = 0.2)
+results <- wgcna_adjacency(datExpr,16,MEDissThres = 0.25)
 #results[["adjacency"]]
 #results[["MEs"]]
+
+# look at distribution of proteins in modules
 table(results[["moduleColors"]])
-results[["moduleColors"]]["c22249_g1",]
-results[["moduleColors"]]["c65172_g1",]
-results[["moduleColors"]]["c22290_g4",]
-temp<-t(rbind(as.numeric(factors[colnames(fpkm),"days"]),fpkm["c22290_g4",]))
-plot(temp[,1],temp[,2])
-cor.test(temp[,1],temp[,2])
+table(results[["moduleColors"]][proteins$id,])
+proteinsInModules <-data.frame(colors=results[["moduleColors"]][proteins$id,],class=proteins$class,description=proteins$description)
+rownames(proteinsInModules)<-proteins$id
+table(results[["moduleColors"]][proteins$id,])/table(results[["moduleColors"]])*100
+connectivity <- intramodularConnectivity(results[["adjacency"]],results[["moduleColors"]]$moduleColors)
+
+#which proteins change in level across the time series?
+for (i in proteins$id) {
+  a<-cor.test(as.numeric(factors$days),as.numeric(fpkm[i,factors$id]),method="spearman")
+  print(paste(i,proteinsInModules[i,"description"])); print(a$estimate); print (a$p.value)
+
+  plot(as.numeric(factors$days),log(as.numeric(fpkm["c22249_g1",factors$id])))
+
+}
+green <- results[["adjacency"]][results[["moduleColors"]]$moduleColor=="green",results[["moduleColors"]]$moduleColor=="green"]
+greenAttrib <- data.frame(class=proteins[rownames(green),"class"],blast=blast[rownames(green),"description"])
+rownames(greenAttrib) <- rownames(green)
+greenAttrib$expressed <- 0
+greenAttrib[proteins$id[proteins$id %in% rownames(green)],"expressed"] <- 1
+#exportNetworkToVisANT(results[["adjacency"]][results[["moduleColors"]]$moduleColor=="green",results[["moduleColors"]]$moduleColor=="green"],"~/Desktop/mucrosquamatus/adjacency.txt")
+exportNetworkToCytoscape(green,edgeFile="~/Desktop/mucrosquamatus/edges.txt",nodeFile="~/Desktop/mucrosquamatus/nodes.txt",nodeAttr=greenAttrib[,"expressed"],nodeNames=rownames(green),includeColNames=TRUE,threshold = 0.5)
+
 ```
+
 
 
 ```{r module_trait}
@@ -222,4 +249,65 @@ print(table(moduleTraitPvalue < 0.05))
 
 ggplot(data.frame(cor=moduleTraitCor,name=rownames(moduleTraitCor),pval=moduleTraitPvalue),aes(x=1,y=name,label=paste(signif(moduleTraitCor, 2), " (", signif(moduleTraitPvalue, 2), ")", sep = "")))+ geom_tile(aes(fill=cor))+ scale_fill_gradient(low = "steelblue",high = "#FF4D4D")+theme_bw()+geom_text()+xlab("")+ylab("")+theme(axis.text.x  = element_blank(),axis.ticks.x  = element_blank())
 
+```
+
+
+```{r go_term_enricment}
+go <- dbGetQuery(mydb,'SELECT go, "ISS" as evidence, id FROM go')
+goFrame=GOFrame(go,organism="Protobothrops mucrosquamatus")
+universe<-unique(go$id)
+goAllFrame=GOAllFrame(goFrame)
+gsc <- GeneSetCollection(goAllFrame, setType = GOCollection())
+
+# GO terms upregulated in tan module
+
+thistle2Upreg <- hyperGTest(GSEAGOHyperGParams(name = "thistle2 upregulated", geneSetCollection=gsc, geneIds = intersect(universe,rownames(results[["moduleColors"]])[results[["moduleColors"]]$moduleColors=="thistle2"]), universeGeneIds=universe, ontology = "BP",pvalueCutoff = 0.05,conditional = TRUE,testDirection = "over"))
+summary(thistle2Upreg)
+
+greenUpreg <- hyperGTest(GSEAGOHyperGParams(name = "green upregulated", geneSetCollection=gsc, geneIds = intersect(universe,rownames(results[["moduleColors"]])[results[["moduleColors"]]$moduleColors=="green"]), universeGeneIds=universe, ontology = "BP",pvalueCutoff = 0.05,conditional = TRUE,testDirection = "over"))
+summary(greenUpreg)
+
+```
+
+```{r exploring_green_module}
+green <- data.frame(connectivity = connectivity[results[["moduleColors"]]=="green","kWithin"])
+rownames(green) <- rownames(connectivity[results[["moduleColors"]]=="green",])
+green$venom <- 0; green[proteins$id,"venom"] <- 1
+ggplot(green,aes(connectivity))+geom_histogram()+geom_rug(data=subset(green,venom==1),aes(connectivity,color="red"))+my_theme()
+```
+
+```{r exploring_thistle2_module}
+thistle2 <- data.frame(connectivity = connectivity[results[["moduleColors"]]=="thistle2","kWithin"])
+rownames(thistle2) <- rownames(connectivity[results[["moduleColors"]]=="thistle2",])
+thistle2$venom <- 0; thistle2[proteins$id,"venom"] <- 1
+ggplot(thistle2,aes(connectivity))+geom_histogram()+geom_rug(data=subset(thistle2,venom==1),aes(connectivity,color="red"))+my_theme()
+```
+
+```{r evolutionary_rate_analysis}
+rateAnalysis <- subset(na.omit(data.frame(module = results[["moduleColors"]]$moduleColors, rate=blast[rownames(results[["moduleColors"]]),"rate"])),rate<3 & module != "grey")
+moduleMeans <- aggregate(rateAnalysis$rate,by=list(rateAnalysis$module),FUN=mean)
+rateAnalysis$module <- factor(rateAnalysis$module, levels = moduleMeans[order(-moduleMeans[,2]),1])
+ggplot(rateAnalysis,aes(module,rate))+geom_boxplot()+my_theme()
+```
+
+
+```{r connectivity_analysis}
+connectivityAnalysis <- data.frame(module = results[["moduleColors"]]$moduleColors, connectivity=connectivity$kWithin)
+moduleMeans <- aggregate(connectivityAnalysis$connectivity,by=list(connectivityAnalysis$module),FUN=mean)
+connectivityAnalysis$module <- factor(connectivityAnalysis$module, levels = moduleMeans[order(-moduleMeans[,2]),1])
+
+ggplot(connectivityAnalysis,aes(module,connectivity))+geom_boxplot()+my_theme()
+connectivityExpressed <- connectivity[rownames(proteins),]
+connectivityExpressed$class <- proteins$class
+connectivityExpressed$module <- results[["moduleColors"]][rownames(proteins),"moduleColors"]
+connectivityExpressed$expression <- rowMeans(fpkm)[rownames(proteins)]
+connectivityExpressed$dnds <- blast[rownames(proteins),"rate"]
+connectivityExpressed$dnds[connectivityExpressed$dnds > 5] <- NA
+ggplot(subset(connectivityExpressed,class!=""),aes(factor(class),kWithin,size=log(expression),color=dnds))+geom_jitter()+my_theme()+theme(axis.text.x = element_text(angle = 45, hjust = 1))+facet_grid(.~module,scales="free_x",space="free_x")
+
+connectivity.glm<-glm(sqrt(dnds)~log(expression)*log(kWithin),data=connectivityExpressed)
+with(connectivityExpressed,cor.test(dnds,expression,method="spearman"))
+hist(resid(connectivity.glm))
+summary(connectivity.glm)
+ggplot(na.omit(connectivityExpressed),aes(expression,kWithin,color=dnds))+geom_point(size=3)+my_theme()+scale_x_log10()+scale_y_log10()+stat_smooth(method="lm",se=FALSE)
 ```
